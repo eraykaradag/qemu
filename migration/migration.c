@@ -3377,6 +3377,10 @@ static MigIterateState migration_iteration_run(MigrationState *s)
             migration_iteration_go_next(&pending);
         }
 
+        if (migrate_postcopy_ram() && !qatomic_read(&s->start_postcopy)) {
+            qatomic_set(&s->start_postcopy, true);
+        }
+
         /* Should we switch to postcopy now? */
         if (can_switchover && postcopy_should_start(s, &pending)) {
             if (postcopy_start(s, &local_err)) {
