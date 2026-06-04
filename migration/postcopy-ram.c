@@ -431,7 +431,8 @@ static void *runahead_thread(void *opaque)
     rcu_register_thread();
     fprintf(stderr, "[RUNAHEAD] Thread started\n");
     if (!runahead_snapshot(s)) {
-        fprintf(stderr, "[RUNAHEAD] KVM register read failed\n");
+        fprintf(stderr, "[RUNAHEAD] KVM register read failed: %s (fd=%d)\n",
+                strerror(errno), s->kvm_fd);
         goto out;
     }
     fprintf(stderr, "[RUNAHEAD] PC=0x%"PRIx64" satp=0x%"PRIx64"\n", s->pc, s->satp);
