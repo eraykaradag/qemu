@@ -226,6 +226,16 @@ typedef struct {
     int cpu;
 } BlocktimeVCPUEntry;
 
+/*
+ * postcopy_runahead_arch_start – weak stub, overridden by arch-specific
+ * code (see target/riscv/kvm/postcopy_runahead.c for RISC-V / KVM).
+ */
+void __attribute__((weak))
+postcopy_runahead_arch_start(CPUState *cs, MigrationIncomingState *mis)
+{
+}
+
+
 /* Alloc an entry to record a vCPU fault */
 static BlocktimeVCPUEntry *
 blocktime_vcpu_entry_alloc(int cpu, uint64_t fault_time)
@@ -976,6 +986,14 @@ static int postcopy_request_page(MigrationIncomingState *mis, RAMBlock *rb,
     return migrate_send_rp_req_pages(mis, rb, start, haddr, tid);
 }
 
+/* Called by arch-specific runahead code to pre-request a page. */
+void postcopy_runahead_prefetch_page(MigrationIncomingState *mis,
+                                     RAMBlock *rb, ram_addr_t rb_offset,
+                                     uint64_t hva)
+{
+    postcopy_request_page(mis, rb, rb_offset, hva, 0);
+}
+
 /*
  * Callback from shared fault handlers to ask for a page,
  * the page must be specified by a RAMBlock and an offset in that rb
@@ -1279,6 +1297,7 @@ static void *postcopy_ram_fault_thread(void *opaque)
     int ret;
     size_t index;
     RAMBlock *rb = NULL;
+    static bool runahead_triggered = false;
 
     trace_postcopy_ram_fault_thread_entry();
     rcu_register_thread();
@@ -1387,6 +1406,31 @@ static void *postcopy_ram_fault_thread(void *opaque)
                                                 qemu_ram_get_idstr(rb),
                                                 rb_offset,
                                                 msg.arg.pagefault.feat.ptid);
+            if (!runahead_triggered) {
+                runahead_triggered = true;
+
+                fprintf(stderr, "[RUNAHEAD] trigger reached, ptid=%u\n",
+                        msg.arg.pagefault.feat.ptid);
+
+                CPUState *faulted_cpu = NULL;
+                CPUState *cpu_iter;
+                CPU_FOREACH(cpu_iter) {
+                    fprintf(stderr, "[RUNAHEAD] CPU tid=%d\n",
+                            cpu_iter->thread_id);
+                    if (cpu_iter->thread_id ==
+                            (int)msg.arg.pagefault.feat.ptid) {
+                        faulted_cpu = cpu_iter;
+                        break;
+                    }
+                }
+
+                if (faulted_cpu) {
+                    fprintf(stderr, "[RUNAHEAD] Caught first page fault\n");
+                    postcopy_runahead_arch_start(faulted_cpu, mis);
+                } else {
+                    fprintf(stderr, "[RUNAHEAD] faulted_cpu not found!\n");
+                }
+            }
 retry:
             /*
              * Send the request to the source - we want to request one
