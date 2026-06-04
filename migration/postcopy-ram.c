@@ -1406,17 +1406,11 @@ static void *postcopy_ram_fault_thread(void *opaque)
                                                 qemu_ram_get_idstr(rb),
                                                 rb_offset,
                                                 msg.arg.pagefault.feat.ptid);
-            if (!runahead_triggered) {
-                runahead_triggered = true;
-
-                fprintf(stderr, "[RUNAHEAD] trigger reached, ptid=%u\n",
-                        msg.arg.pagefault.feat.ptid);
-
+            if (!runahead_triggered &&
+                    msg.arg.pagefault.feat.ptid != 0) {
                 CPUState *faulted_cpu = NULL;
                 CPUState *cpu_iter;
                 CPU_FOREACH(cpu_iter) {
-                    fprintf(stderr, "[RUNAHEAD] CPU tid=%d\n",
-                            cpu_iter->thread_id);
                     if (cpu_iter->thread_id ==
                             (int)msg.arg.pagefault.feat.ptid) {
                         faulted_cpu = cpu_iter;
@@ -1425,10 +1419,9 @@ static void *postcopy_ram_fault_thread(void *opaque)
                 }
 
                 if (faulted_cpu) {
+                    runahead_triggered = true;
                     fprintf(stderr, "[RUNAHEAD] Caught first page fault\n");
                     postcopy_runahead_arch_start(faulted_cpu, mis);
-                } else {
-                    fprintf(stderr, "[RUNAHEAD] faulted_cpu not found!\n");
                 }
             }
 retry:
