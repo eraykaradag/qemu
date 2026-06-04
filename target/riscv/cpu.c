@@ -822,6 +822,17 @@ static void riscv_cpu_reset_hold(Object *obj, ResetType type)
 #endif
 }
 
+static void riscv_cpu_runahead_get_regs(CPUState *cs, uint64_t *pc,
+                                        uint64_t regs[32], uint64_t *satp)
+{
+    CPURISCVState *env = &RISCV_CPU(cs)->env;
+    int i;
+    *pc = env->pc;
+    for (i = 0; i < 32; i++)
+        regs[i] = env->gpr[i];
+    *satp = env->satp;
+}
+
 static void riscv_cpu_disas_set_info(const CPUState *s, disassemble_info *info)
 {
     const RISCVCPU *cpu = RISCV_CPU(s);
@@ -2618,6 +2629,7 @@ static void riscv_cpu_common_class_init(ObjectClass *c, const void *data)
     cc->gdb_write_register = riscv_cpu_gdb_write_register;
     cc->gdb_stop_before_watchpoint = true;
     cc->disas_set_info = riscv_cpu_disas_set_info;
+    cc->runahead_get_regs = riscv_cpu_runahead_get_regs;
 #ifndef CONFIG_USER_ONLY
     cc->sysemu_ops = &riscv_sysemu_ops;
     cc->get_arch_id = riscv_get_arch_id;

@@ -236,18 +236,7 @@ typedef struct {
  * linker dependencies. Fails gracefully on non-RISC-V / non-KVM.    *
  * ------------------------------------------------------------------ */
 
-#include <sys/ioctl.h>
-
-/* KVM_GET_ONE_REG ioctl number (from linux/kvm.h, no header needed) */
-#define RA_KVM_GET_ONE_REG      _IOW(0xAE, 0xab, struct { uint64_t id; uint64_t addr; })
-
-/* RISC-V KVM register IDs (linux-headers/asm-riscv/kvm.h) */
-#define RA_KVM_RISCV    0x8000000000000000ULL
-#define RA_KVM_SIZE_U64 0x0030000000000000ULL
-#define RA_CORE_REG(i)  (RA_KVM_RISCV | RA_KVM_SIZE_U64 | (0x02ULL << 24) | (uint64_t)(i))
-#define RA_CSR_REG(i)   (RA_KVM_RISCV | RA_KVM_SIZE_U64 | (0x03ULL << 24) | (uint64_t)(i))
-#define RA_REG_PC       RA_CORE_REG(0)
-#define RA_REG_SATP     RA_CSR_REG(8)
+#include "hw/core/cpu.h"
 
 #define RUNAHEAD_MAX_INSNS 2048
 
@@ -257,18 +246,8 @@ typedef struct {
     uint64_t                reg_valid;
     uint64_t                pc;
     uint64_t                satp;
-    int                     kvm_fd;
     MigrationIncomingState *mis;
 } RunaheadState;
-
-static int ra_kvm_get(int fd, uint64_t id, uint64_t *val)
-{
-    struct { uint64_t id; uint64_t addr; } reg = {
-        .id   = id,
-        .addr = (uint64_t)(uintptr_t)val,
-    };
-    return ioctl(fd, _IOW(0xAE, 0xab, struct { uint64_t id; uint64_t addr; }), &reg);
-}
 
 static inline bool ra_valid(RunaheadState *s, int r)
 { return !!(s->reg_valid & (1ULL << r)); }
@@ -282,19 +261,16 @@ static inline void ra_inv(RunaheadState *s, int rd)
 static inline int64_t ra_sext(uint64_t v, int bits)
 { int sh = 64 - bits; return (int64_t)(v << sh) >> sh; }
 
-static bool runahead_snapshot(RunaheadState *s)
+static bool runahead_snapshot(RunaheadState *s, CPUState *cs)
 {
-    uint64_t reg; int i;
-    if (ra_kvm_get(s->kvm_fd, RA_REG_PC, &reg)) return false;
-    s->pc = reg;
+    CPUClass *cc = CPU_GET_CLASS(cs);
+    if (!cc->runahead_get_regs) {
+        fprintf(stderr, "[RUNAHEAD] runahead_get_regs not implemented for this CPU\n");
+        return false;
+    }
+    cc->runahead_get_regs(cs, &s->pc, s->regs, &s->satp);
     s->regs[0]   = 0;
     s->reg_valid = ~0ULL;
-    for (i = 1; i < 32; i++) {
-        if (ra_kvm_get(s->kvm_fd, RA_CORE_REG(i), &reg)) return false;
-        s->regs[i] = reg;
-    }
-    if (ra_kvm_get(s->kvm_fd, RA_REG_SATP, &reg)) return false;
-    s->satp = reg;
     return true;
 }
 
@@ -424,15 +400,27 @@ done:
     return npc;
 }
 
+typedef struct {
+    CPUState               *cs;
+    MigrationIncomingState *mis;
+} RunaheadArgs;
+
 static void *runahead_thread(void *opaque)
 {
-    RunaheadState *s = opaque;
+    RunaheadArgs *args = opaque;
+    CPUState *cs       = args->cs;
+    MigrationIncomingState *mis = args->mis;
+    g_free(args);
+
+    RunaheadState state = {0};
+    RunaheadState *s    = &state;
+    s->mis = mis;
     int i;
+
     rcu_register_thread();
     fprintf(stderr, "[RUNAHEAD] Thread started\n");
-    if (!runahead_snapshot(s)) {
-        fprintf(stderr, "[RUNAHEAD] KVM register read failed: %s (fd=%d)\n",
-                strerror(errno), s->kvm_fd);
+    if (!runahead_snapshot(s, cs)) {
+        fprintf(stderr, "[RUNAHEAD] Register snapshot failed\n");
         goto out;
     }
     fprintf(stderr, "[RUNAHEAD] PC=0x%"PRIx64" satp=0x%"PRIx64"\n", s->pc, s->satp);
@@ -449,16 +437,17 @@ static void *runahead_thread(void *opaque)
     fprintf(stderr, "[RUNAHEAD] Done after %d insns\n", i);
 out:
     rcu_unregister_thread();
-    g_free(s);
     return NULL;
 }
 
 static void runahead_start(CPUState *cs, MigrationIncomingState *mis)
 {
-    RunaheadState *s = g_new0(RunaheadState, 1);
-    s->kvm_fd = cs->kvm_fd;
-    s->mis    = mis;
-    qemu_thread_create(&s->thread, "runahead", runahead_thread, s,
+    RunaheadArgs *args = g_new0(RunaheadArgs, 1);
+    args->cs  = cs;
+    args->mis = mis;
+
+    QemuThread t;
+    qemu_thread_create(&t, "runahead", runahead_thread, args,
                        QEMU_THREAD_DETACHED);
 }
 

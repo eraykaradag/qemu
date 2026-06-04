@@ -177,6 +177,14 @@ struct CPUClass {
 
     void (*disas_set_info)(const CPUState *cpu, disassemble_info *info);
 
+    /*
+     * Optional callback for postcopy runahead prefetching.
+     * Reads PC, GPRs (regs[0..31]) and SATP from the CPU state.
+     * Only implemented by RISC-V; NULL on other architectures.
+     */
+    void (*runahead_get_regs)(CPUState *cpu, uint64_t *pc,
+                              uint64_t regs[32], uint64_t *satp);
+
     const char *deprecation_note;
     struct AccelCPUClass *accel_cpu;
 
