@@ -38,6 +38,9 @@
 #include "qemu/userfaultfd.h"
 #include "qemu/mmap-alloc.h"
 #include "options.h"
+#include "system/memory.h"
+#include "system/address-spaces.h"
+#include "exec/cpu-common.h"
 
 /* Arbitrary limit on size of each discard command,
  * keeps them around ~200 bytes
@@ -226,16 +229,236 @@ typedef struct {
     int cpu;
 } BlocktimeVCPUEntry;
 
-/*
- * Function pointer registered by arch-specific code at startup.
- * NULL means no runahead implementation is available.
- */
-static void (*runahead_start_fn)(CPUState *, MigrationIncomingState *);
+/* ------------------------------------------------------------------ *
+ * Execution-driven runahead prefetching (RISC-V / KVM)               *
+ *                                                                     *
+ * Uses raw ioctl() instead of kvm_get_one_reg() to avoid cross-lib   *
+ * linker dependencies. Fails gracefully on non-RISC-V / non-KVM.    *
+ * ------------------------------------------------------------------ */
 
-void postcopy_runahead_register(
-        void (*fn)(CPUState *, MigrationIncomingState *))
+#include <sys/ioctl.h>
+
+/* KVM_GET_ONE_REG ioctl number (from linux/kvm.h, no header needed) */
+#define RA_KVM_GET_ONE_REG      _IOW(0xAE, 0xab, struct { uint64_t id; uint64_t addr; })
+
+/* RISC-V KVM register IDs (linux-headers/asm-riscv/kvm.h) */
+#define RA_KVM_RISCV    0x8000000000000000ULL
+#define RA_KVM_SIZE_U64 0x0030000000000000ULL
+#define RA_CORE_REG(i)  (RA_KVM_RISCV | RA_KVM_SIZE_U64 | (0x02ULL << 24) | (uint64_t)(i))
+#define RA_CSR_REG(i)   (RA_KVM_RISCV | RA_KVM_SIZE_U64 | (0x03ULL << 24) | (uint64_t)(i))
+#define RA_REG_PC       RA_CORE_REG(0)
+#define RA_REG_SATP     RA_CSR_REG(8)
+
+#define RUNAHEAD_MAX_INSNS 2048
+
+typedef struct {
+    QemuThread              thread;
+    uint64_t                regs[32];
+    uint64_t                reg_valid;
+    uint64_t                pc;
+    uint64_t                satp;
+    int                     kvm_fd;
+    MigrationIncomingState *mis;
+} RunaheadState;
+
+static int ra_kvm_get(int fd, uint64_t id, uint64_t *val)
 {
-    runahead_start_fn = fn;
+    struct { uint64_t id; uint64_t addr; } reg = {
+        .id   = id,
+        .addr = (uint64_t)(uintptr_t)val,
+    };
+    return ioctl(fd, _IOW(0xAE, 0xab, struct { uint64_t id; uint64_t addr; }), &reg);
+}
+
+static inline bool ra_valid(RunaheadState *s, int r)
+{ return !!(s->reg_valid & (1ULL << r)); }
+
+static inline void ra_write(RunaheadState *s, int rd, uint64_t v)
+{ if (rd) { s->regs[rd] = v; s->reg_valid |= 1ULL << rd; } }
+
+static inline void ra_inv(RunaheadState *s, int rd)
+{ if (rd) s->reg_valid &= ~(1ULL << rd); }
+
+static inline int64_t ra_sext(uint64_t v, int bits)
+{ int sh = 64 - bits; return (int64_t)(v << sh) >> sh; }
+
+static bool runahead_snapshot(RunaheadState *s)
+{
+    uint64_t reg; int i;
+    if (ra_kvm_get(s->kvm_fd, RA_REG_PC, &reg)) return false;
+    s->pc = reg;
+    s->regs[0]   = 0;
+    s->reg_valid = ~0ULL;
+    for (i = 1; i < 32; i++) {
+        if (ra_kvm_get(s->kvm_fd, RA_CORE_REG(i), &reg)) return false;
+        s->regs[i] = reg;
+    }
+    if (ra_kvm_get(s->kvm_fd, RA_REG_SATP, &reg)) return false;
+    s->satp = reg;
+    return true;
+}
+
+static uint64_t ra_sv39(uint64_t satp, uint64_t va)
+{
+    int mode = (satp >> 60) & 0xF;
+    if (mode == 0) return va;
+    if (mode != 8) return -1ULL;
+    uint64_t vpn[3] = { (va>>12)&0x1FF, (va>>21)&0x1FF, (va>>30)&0x1FF };
+    uint64_t pt = (satp & ((1ULL<<44)-1)) << 12;
+    for (int lvl = 2; lvl >= 0; lvl--) {
+        uint64_t pte = 0;
+        cpu_physical_memory_read(pt + vpn[lvl]*8, &pte, sizeof(pte));
+        if (!(pte & 1)) return -1ULL;
+        uint64_t ppn = (pte >> 10) & ((1ULL<<44)-1);
+        if (pte & 0xE) {
+            uint64_t pa = ppn << 12;
+            for (int i = 0; i < lvl; i++) pa |= vpn[i] << (12 + 9*i);
+            return pa | (va & 0xFFF);
+        }
+        pt = ppn << 12;
+    }
+    return -1ULL;
+}
+
+/* Forward declaration */
+static int postcopy_request_page(MigrationIncomingState *mis, RAMBlock *rb,
+                                 ram_addr_t start, uint64_t haddr, uint32_t tid);
+
+static void ra_prefetch(RunaheadState *s, uint64_t gva)
+{
+    uint64_t gpa = ra_sv39(s->satp, gva);
+    if (gpa == -1ULL) return;
+    RCU_READ_LOCK_GUARD();
+    hwaddr xlat, len = TARGET_PAGE_SIZE;
+    MemoryRegion *mr = address_space_translate(&address_space_memory,
+                           gpa, &xlat, &len, false, MEMTXATTRS_UNSPECIFIED);
+    if (!memory_region_is_ram(mr)) return;
+    void *hva = qemu_map_ram_ptr(mr->ram_block, xlat);
+    ram_addr_t rbo;
+    RAMBlock *rb = qemu_ram_block_from_host(hva, true, &rbo);
+    if (!rb) return;
+    postcopy_request_page(s->mis, rb, rbo, (uint64_t)(uintptr_t)hva, 0);
+}
+
+static uint64_t ra_sim(RunaheadState *s, uint32_t insn)
+{
+    int op=insn&0x7F, rd=(insn>>7)&0x1F, rs1=(insn>>15)&0x1F,
+        rs2=(insn>>20)&0x1F, f3=(insn>>12)&0x7, f7=(insn>>25)&0x7F;
+    uint64_t npc = s->pc + 4;
+    switch (op) {
+    case 0x03: case 0x07: {
+        int64_t imm = ra_sext(insn>>20, 12);
+        if (ra_valid(s,rs1)) ra_prefetch(s, s->regs[rs1]+imm);
+        if (op==0x03) ra_inv(s,rd); break; }
+    case 0x23: case 0x27: {
+        int64_t imm = ra_sext(((insn>>25)<<5)|((insn>>7)&0x1F), 12);
+        if (ra_valid(s,rs1)) ra_prefetch(s, s->regs[rs1]+imm); break; }
+    case 0x2F:
+        if (ra_valid(s,rs1)) ra_prefetch(s, s->regs[rs1]);
+        ra_inv(s,rd); break;
+    case 0x37: ra_write(s,rd,(int64_t)(int32_t)(insn&0xFFFFF000)); break;
+    case 0x17: ra_write(s,rd,s->pc+(int64_t)(int32_t)(insn&0xFFFFF000)); break;
+    case 0x13: {
+        if (!ra_valid(s,rs1)){ra_inv(s,rd);break;}
+        uint64_t a=s->regs[rs1], sh=(insn>>20)&0x3F, res;
+        int64_t imm=ra_sext(insn>>20,12);
+        switch(f3){
+        case 0:res=a+imm;break; case 1:res=a<<sh;break;
+        case 2:res=(int64_t)a<imm?1:0;break;
+        case 3:res=a<(uint64_t)(int64_t)imm?1:0;break;
+        case 4:res=a^(uint64_t)imm;break;
+        case 5:res=(f7&0x20)?(uint64_t)((int64_t)a>>sh):a>>sh;break;
+        case 6:res=a|(uint64_t)imm;break;
+        case 7:res=a&(uint64_t)imm;break;
+        default:ra_inv(s,rd);goto done;}
+        ra_write(s,rd,res); break; }
+    case 0x1B: {
+        if (!ra_valid(s,rs1)){ra_inv(s,rd);break;}
+        uint64_t a=s->regs[rs1], sh=(insn>>20)&0x1F, res;
+        int64_t imm=ra_sext(insn>>20,12);
+        switch(f3){
+        case 0:res=(int64_t)(int32_t)((uint32_t)a+(int32_t)imm);break;
+        case 1:res=(int64_t)(int32_t)((uint32_t)a<<sh);break;
+        case 5:res=(f7&0x20)?(int64_t)((int32_t)a>>sh):(int64_t)(int32_t)((uint32_t)a>>sh);break;
+        default:ra_inv(s,rd);goto done;}
+        ra_write(s,rd,res); break; }
+    case 0x33: {
+        if (!ra_valid(s,rs1)||!ra_valid(s,rs2)){ra_inv(s,rd);break;}
+        if (f7==0x01){ra_inv(s,rd);break;}
+        uint64_t a=s->regs[rs1],b=s->regs[rs2],res;
+        switch(f3){
+        case 0:res=(f7&0x20)?a-b:a+b;break; case 1:res=a<<(b&0x3F);break;
+        case 2:res=(int64_t)a<(int64_t)b?1:0;break; case 3:res=a<b?1:0;break;
+        case 4:res=a^b;break;
+        case 5:res=(f7&0x20)?(uint64_t)((int64_t)a>>(b&0x3F)):a>>(b&0x3F);break;
+        case 6:res=a|b;break; case 7:res=a&b;break;
+        default:ra_inv(s,rd);goto done;}
+        ra_write(s,rd,res); break; }
+    case 0x3B: {
+        if (!ra_valid(s,rs1)||!ra_valid(s,rs2)){ra_inv(s,rd);break;}
+        if (f7==0x01){ra_inv(s,rd);break;}
+        uint64_t a=s->regs[rs1],b=s->regs[rs2],res;
+        switch(f3){
+        case 0:res=(int64_t)(int32_t)((f7&0x20)?a-b:a+b);break;
+        case 1:res=(int64_t)(int32_t)((uint32_t)a<<(b&0x1F));break;
+        case 5:res=(f7&0x20)?(int64_t)((int32_t)a>>(b&0x1F)):(int64_t)(int32_t)((uint32_t)a>>(b&0x1F));break;
+        default:ra_inv(s,rd);goto done;}
+        ra_write(s,rd,res); break; }
+    case 0x6F: {
+        int64_t imm=ra_sext((((insn>>31)&1)<<20)|(((insn>>12)&0xFF)<<12)|
+                            (((insn>>20)&1)<<11)|(((insn>>21)&0x3FF)<<1),21);
+        ra_write(s,rd,s->pc+4); npc=s->pc+imm; break; }
+    case 0x67: {
+        int64_t imm=ra_sext(insn>>20,12);
+        ra_write(s,rd,s->pc+4);
+        if (!ra_valid(s,rs1)) return 0;
+        npc=(s->regs[rs1]+imm)&~1ULL; break; }
+    case 0x63: {
+        int64_t imm=ra_sext((((insn>>31)&1)<<12)|(((insn>>7)&1)<<11)|
+                            (((insn>>25)&0x3F)<<5)|(((insn>>8)&0xF)<<1),13);
+        if (imm<0) npc=s->pc+imm; break; }
+    case 0x0F: case 0x73: break;
+    default: return 0;
+    }
+done:
+    return npc;
+}
+
+static void *runahead_thread(void *opaque)
+{
+    RunaheadState *s = opaque;
+    int i;
+    rcu_register_thread();
+    fprintf(stderr, "[RUNAHEAD] Thread started\n");
+    if (!runahead_snapshot(s)) {
+        fprintf(stderr, "[RUNAHEAD] KVM register read failed\n");
+        goto out;
+    }
+    fprintf(stderr, "[RUNAHEAD] PC=0x%"PRIx64" satp=0x%"PRIx64"\n", s->pc, s->satp);
+    for (i = 0; i < RUNAHEAD_MAX_INSNS; i++) {
+        uint64_t gpa = ra_sv39(s->satp, s->pc);
+        if (gpa == -1ULL) break;
+        uint32_t insn = 0;
+        cpu_physical_memory_read(gpa, &insn, sizeof(insn));
+        if ((insn & 0x3) != 0x3) { s->pc += 2; continue; }
+        uint64_t npc = ra_sim(s, insn);
+        if (!npc) break;
+        s->pc = npc;
+    }
+    fprintf(stderr, "[RUNAHEAD] Done after %d insns\n", i);
+out:
+    rcu_unregister_thread();
+    g_free(s);
+    return NULL;
+}
+
+static void runahead_start(CPUState *cs, MigrationIncomingState *mis)
+{
+    RunaheadState *s = g_new0(RunaheadState, 1);
+    s->kvm_fd = cs->kvm_fd;
+    s->mis    = mis;
+    qemu_thread_create(&s->thread, "runahead", runahead_thread, s,
+                       QEMU_THREAD_DETACHED);
 }
 
 
@@ -1421,10 +1644,10 @@ static void *postcopy_ram_fault_thread(void *opaque)
                     }
                 }
 
-                if (faulted_cpu && runahead_start_fn) {
+                if (faulted_cpu) {
                     runahead_triggered = true;
                     fprintf(stderr, "[RUNAHEAD] Caught first page fault\n");
-                    runahead_start_fn(faulted_cpu, mis);
+                    runahead_start(faulted_cpu, mis);
                 }
             }
 retry:

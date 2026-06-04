@@ -202,10 +202,6 @@ void mark_postcopy_blocktime_begin(uintptr_t addr, uint32_t ptid,
 int postcopy_incoming_setup(MigrationIncomingState *mis, Error **errp);
 int postcopy_incoming_cleanup(MigrationIncomingState *mis);
 
-/* Register arch-specific runahead implementation (call from constructor). */
-struct CPUState;
-void postcopy_runahead_register(
-        void (*fn)(struct CPUState *, MigrationIncomingState *));
 
 /*
  * Request a single page from the source for prefetching purposes.
