@@ -423,10 +423,16 @@ static void *runahead_thread(void *opaque)
         fprintf(stderr, "[RUNAHEAD] Register snapshot failed\n");
         goto out;
     }
-    fprintf(stderr, "[RUNAHEAD] PC=0x%"PRIx64" satp=0x%"PRIx64"\n", s->pc, s->satp);
+    fprintf(stderr, "[RUNAHEAD] PC=0x%"PRIx64" satp=0x%"PRIx64" mode=%d\n",
+            s->pc, s->satp, (int)((s->satp >> 60) & 0xF));
     for (i = 0; i < RUNAHEAD_MAX_INSNS; i++) {
         uint64_t gpa = ra_sv39(s->satp, s->pc);
-        if (gpa == -1ULL) break;
+        if (gpa == -1ULL) {
+            if (i == 0)
+                fprintf(stderr, "[RUNAHEAD] sv39 walk failed for PC=0x%"PRIx64"\n",
+                        s->pc);
+            break;
+        }
         uint32_t insn = 0;
         cpu_physical_memory_read(gpa, &insn, sizeof(insn));
         if ((insn & 0x3) != 0x3) { s->pc += 2; continue; }
