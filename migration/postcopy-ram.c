@@ -246,6 +246,7 @@ typedef struct {
     uint64_t                reg_valid;
     uint64_t                pc;
     uint64_t                satp;
+    unsigned long           prefetch_count;
     MigrationIncomingState *mis;
 } RunaheadState;
 
@@ -326,6 +327,7 @@ static void ra_prefetch(RunaheadState *s, uint64_t gva)
     RAMBlock *rb = qemu_ram_block_from_host(hva, true, &rbo);
     if (!rb) return;
     postcopy_request_page(s->mis, rb, rbo, (uint64_t)(uintptr_t)hva, 0);
+    s->prefetch_count++;
 }
 
 static uint64_t ra_sim(RunaheadState *s, uint32_t insn)
@@ -452,7 +454,8 @@ static void *runahead_thread(void *opaque)
         if (!npc) break;
         s->pc = npc;
     }
-    fprintf(stderr, "[RUNAHEAD] Done after %d insns\n", i);
+    fprintf(stderr, "[RUNAHEAD] Done after %d insns, %lu pages prefetched\n",
+            i, s->prefetch_count);
 out:
     rcu_unregister_thread();
     return NULL;
