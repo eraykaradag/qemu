@@ -274,21 +274,33 @@ static bool runahead_snapshot(RunaheadState *s, CPUState *cs)
     return true;
 }
 
-static uint64_t ra_sv39(uint64_t satp, uint64_t va)
+/* Sv39 / Sv48 / Sv57 page table walk (modes 8 / 9 / 10) */
+static uint64_t ra_sv_walk(uint64_t satp, uint64_t va)
 {
     int mode = (satp >> 60) & 0xF;
-    if (mode == 0) return va;
-    if (mode != 8) return -1ULL;
-    uint64_t vpn[3] = { (va>>12)&0x1FF, (va>>21)&0x1FF, (va>>30)&0x1FF };
-    uint64_t pt = (satp & ((1ULL<<44)-1)) << 12;
-    for (int lvl = 2; lvl >= 0; lvl--) {
+    int levels;
+
+    if      (mode == 0)  return va;     /* Bare – no translation */
+    else if (mode == 8)  levels = 3;    /* Sv39 */
+    else if (mode == 9)  levels = 4;    /* Sv48 */
+    else if (mode == 10) levels = 5;    /* Sv57 */
+    else return -1ULL;
+
+    uint64_t vpn[5];
+    int i;
+    for (i = 0; i < levels; i++)
+        vpn[i] = (va >> (12 + 9 * i)) & 0x1FF;
+
+    uint64_t pt = (satp & ((1ULL << 44) - 1)) << 12;
+
+    for (int lvl = levels - 1; lvl >= 0; lvl--) {
         uint64_t pte = 0;
-        cpu_physical_memory_read(pt + vpn[lvl]*8, &pte, sizeof(pte));
+        cpu_physical_memory_read(pt + vpn[lvl] * 8, &pte, sizeof(pte));
         if (!(pte & 1)) return -1ULL;
-        uint64_t ppn = (pte >> 10) & ((1ULL<<44)-1);
-        if (pte & 0xE) {
+        uint64_t ppn = (pte >> 10) & ((1ULL << 44) - 1);
+        if (pte & 0xE) {    /* R|W|X → leaf PTE */
             uint64_t pa = ppn << 12;
-            for (int i = 0; i < lvl; i++) pa |= vpn[i] << (12 + 9*i);
+            for (i = 0; i < lvl; i++) pa |= vpn[i] << (12 + 9 * i);
             return pa | (va & 0xFFF);
         }
         pt = ppn << 12;
@@ -302,7 +314,7 @@ static int postcopy_request_page(MigrationIncomingState *mis, RAMBlock *rb,
 
 static void ra_prefetch(RunaheadState *s, uint64_t gva)
 {
-    uint64_t gpa = ra_sv39(s->satp, gva);
+    uint64_t gpa = ra_sv_walk(s->satp, gva);
     if (gpa == -1ULL) return;
     RCU_READ_LOCK_GUARD();
     hwaddr xlat, len = TARGET_PAGE_SIZE;
@@ -426,7 +438,7 @@ static void *runahead_thread(void *opaque)
     fprintf(stderr, "[RUNAHEAD] PC=0x%"PRIx64" satp=0x%"PRIx64" mode=%d\n",
             s->pc, s->satp, (int)((s->satp >> 60) & 0xF));
     for (i = 0; i < RUNAHEAD_MAX_INSNS; i++) {
-        uint64_t gpa = ra_sv39(s->satp, s->pc);
+        uint64_t gpa = ra_sv_walk(s->satp, s->pc);
         if (gpa == -1ULL) {
             if (i == 0)
                 fprintf(stderr, "[RUNAHEAD] sv39 walk failed for PC=0x%"PRIx64"\n",
