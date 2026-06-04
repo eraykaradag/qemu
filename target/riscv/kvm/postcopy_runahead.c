@@ -387,9 +387,9 @@ out:
     return NULL;
 }
 
-/* ---------- arch hook – called from postcopy-ram.c ----------------- */
+/* ---------- arch hook -------------------------------------------- */
 
-void postcopy_runahead_arch_start(CPUState *cs, MigrationIncomingState *mis)
+static void runahead_arch_start(CPUState *cs, MigrationIncomingState *mis)
 {
     RunaheadState *s = g_new0(RunaheadState, 1);
     s->cs  = cs;
@@ -397,4 +397,14 @@ void postcopy_runahead_arch_start(CPUState *cs, MigrationIncomingState *mis)
     qemu_thread_create(&s->thread, "runahead_thread",
                        runahead_thread_routine, s,
                        QEMU_THREAD_DETACHED);
+}
+
+/*
+ * Register with postcopy-ram.c before main() via constructor.
+ * __attribute__((constructor)) ensures this runs even if no other
+ * code directly references runahead_arch_start (prevents GC).
+ */
+static void __attribute__((constructor)) riscv_runahead_register(void)
+{
+    postcopy_runahead_register(runahead_arch_start);
 }

@@ -227,12 +227,15 @@ typedef struct {
 } BlocktimeVCPUEntry;
 
 /*
- * postcopy_runahead_arch_start – weak stub, overridden by arch-specific
- * code (see target/riscv/kvm/postcopy_runahead.c for RISC-V / KVM).
+ * Function pointer registered by arch-specific code at startup.
+ * NULL means no runahead implementation is available.
  */
-void __attribute__((weak))
-postcopy_runahead_arch_start(CPUState *cs, MigrationIncomingState *mis)
+static void (*runahead_start_fn)(CPUState *, MigrationIncomingState *);
+
+void postcopy_runahead_register(
+        void (*fn)(CPUState *, MigrationIncomingState *))
 {
+    runahead_start_fn = fn;
 }
 
 
@@ -1418,10 +1421,10 @@ static void *postcopy_ram_fault_thread(void *opaque)
                     }
                 }
 
-                if (faulted_cpu) {
+                if (faulted_cpu && runahead_start_fn) {
                     runahead_triggered = true;
                     fprintf(stderr, "[RUNAHEAD] Caught first page fault\n");
-                    postcopy_runahead_arch_start(faulted_cpu, mis);
+                    runahead_start_fn(faulted_cpu, mis);
                 }
             }
 retry:
