@@ -406,5 +406,6 @@ static void runahead_arch_start(CPUState *cs, MigrationIncomingState *mis)
  */
 static void __attribute__((constructor)) riscv_runahead_register(void)
 {
-    postcopy_runahead_register(runahead_arch_start);
+    /* BASELINE: runahead disabled for comparison */
+    /* postcopy_runahead_register(runahead_arch_start); */
 }
