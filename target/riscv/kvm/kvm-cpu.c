@@ -2228,3 +2228,5 @@ void kvm_arch_update_guest_debug(CPUState *cs, struct kvm_guest_debug *dbg)
         dbg->control |= KVM_GUESTDBG_ENABLE;
     }
 }
+
+#include "postcopy_runahead.c"
