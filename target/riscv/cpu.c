@@ -823,14 +823,13 @@ static void riscv_cpu_reset_hold(Object *obj, ResetType type)
 }
 
 static void riscv_cpu_runahead_get_regs(CPUState *cs, uint64_t *pc,
-                                        uint64_t regs[32], uint64_t *satp)
+                                        uint64_t regs[32])
 {
     CPURISCVState *env = &RISCV_CPU(cs)->env;
     int i;
     *pc = env->pc;
     for (i = 0; i < 32; i++)
         regs[i] = env->gpr[i];
-    *satp = env->satp;
 }
 
 static void riscv_cpu_disas_set_info(const CPUState *s, disassemble_info *info)

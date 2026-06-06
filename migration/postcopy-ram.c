@@ -230,22 +230,19 @@ typedef struct {
 } BlocktimeVCPUEntry;
 
 /* ------------------------------------------------------------------ *
- * Execution-driven runahead prefetching (RISC-V / KVM)               *
- *                                                                     *
- * Uses raw ioctl() instead of kvm_get_one_reg() to avoid cross-lib   *
- * linker dependencies. Fails gracefully on non-RISC-V / non-KVM.    *
+ * Execution-driven runahead prefetching                               *
  * ------------------------------------------------------------------ */
 
 #include "hw/core/cpu.h"
 
-#define RUNAHEAD_MAX_INSNS 2048
+#define RUNAHEAD_MAX_INSNS   2048
+#define RUNAHEAD_TARGET_PAGES  64
 
 typedef struct {
-    QemuThread              thread;
+    CPUState               *cs;
     uint64_t                regs[32];
     uint64_t                reg_valid;
     uint64_t                pc;
-    uint64_t                satp;
     unsigned long           prefetch_count;
     MigrationIncomingState *mis;
 } RunaheadState;
@@ -269,44 +266,11 @@ static bool runahead_snapshot(RunaheadState *s, CPUState *cs)
         fprintf(stderr, "[RUNAHEAD] runahead_get_regs not implemented for this CPU\n");
         return false;
     }
-    cc->runahead_get_regs(cs, &s->pc, s->regs, &s->satp);
+    s->cs = cs;
+    cc->runahead_get_regs(cs, &s->pc, s->regs);
     s->regs[0]   = 0;
     s->reg_valid = ~0ULL;
     return true;
-}
-
-/* Sv39 / Sv48 / Sv57 page table walk (modes 8 / 9 / 10) */
-static uint64_t ra_sv_walk(uint64_t satp, uint64_t va)
-{
-    int mode = (satp >> 60) & 0xF;
-    int levels;
-
-    if      (mode == 0)  return va;     /* Bare – no translation */
-    else if (mode == 8)  levels = 3;    /* Sv39 */
-    else if (mode == 9)  levels = 4;    /* Sv48 */
-    else if (mode == 10) levels = 5;    /* Sv57 */
-    else return -1ULL;
-
-    uint64_t vpn[5];
-    int i;
-    for (i = 0; i < levels; i++)
-        vpn[i] = (va >> (12 + 9 * i)) & 0x1FF;
-
-    uint64_t pt = (satp & ((1ULL << 44) - 1)) << 12;
-
-    for (int lvl = levels - 1; lvl >= 0; lvl--) {
-        uint64_t pte = 0;
-        cpu_physical_memory_read(pt + vpn[lvl] * 8, &pte, sizeof(pte));
-        if (!(pte & 1)) return -1ULL;
-        uint64_t ppn = (pte >> 10) & ((1ULL << 44) - 1);
-        if (pte & 0xE) {    /* R|W|X → leaf PTE */
-            uint64_t pa = ppn << 12;
-            for (i = 0; i < lvl; i++) pa |= vpn[i] << (12 + 9 * i);
-            return pa | (va & 0xFFF);
-        }
-        pt = ppn << 12;
-    }
-    return -1ULL;
 }
 
 /* Forward declaration */
@@ -315,14 +279,14 @@ static int postcopy_request_page(MigrationIncomingState *mis, RAMBlock *rb,
 
 static void ra_prefetch(RunaheadState *s, uint64_t gva)
 {
-    uint64_t gpa = ra_sv_walk(s->satp, gva);
-    if (gpa == -1ULL) return;
+    TranslateForDebugResult xlat;
+    if (!cpu_translate_for_debug(s->cs, gva, &xlat)) return;
     RCU_READ_LOCK_GUARD();
-    hwaddr xlat, len = TARGET_PAGE_SIZE;
+    hwaddr off, len = TARGET_PAGE_SIZE;
     MemoryRegion *mr = address_space_translate(&address_space_memory,
-                           gpa, &xlat, &len, false, MEMTXATTRS_UNSPECIFIED);
+                           xlat.physaddr, &off, &len, false, MEMTXATTRS_UNSPECIFIED);
     if (!memory_region_is_ram(mr)) return;
-    void *hva = qemu_map_ram_ptr(mr->ram_block, xlat);
+    void *hva = qemu_map_ram_ptr(mr->ram_block, off);
     ram_addr_t rbo;
     RAMBlock *rb = qemu_ram_block_from_host(hva, true, &rbo);
     if (!rb) return;
@@ -437,18 +401,17 @@ static void *runahead_thread(void *opaque)
         fprintf(stderr, "[RUNAHEAD] Register snapshot failed\n");
         goto out;
     }
-    fprintf(stderr, "[RUNAHEAD] PC=0x%"PRIx64" satp=0x%"PRIx64" mode=%d\n",
-            s->pc, s->satp, (int)((s->satp >> 60) & 0xF));
+    fprintf(stderr, "[RUNAHEAD] PC=0x%"PRIx64"\n", s->pc);
+    if (s->pc >> 56) {
+        fprintf(stderr, "[RUNAHEAD] Kernel PC, skipping\n");
+        goto out;
+    }
     for (i = 0; i < RUNAHEAD_MAX_INSNS; i++) {
-        uint64_t gpa = ra_sv_walk(s->satp, s->pc);
-        if (gpa == -1ULL) {
-            if (i == 0)
-                fprintf(stderr, "[RUNAHEAD] sv39 walk failed for PC=0x%"PRIx64"\n",
-                        s->pc);
-            break;
-        }
+        if (s->prefetch_count >= RUNAHEAD_TARGET_PAGES) break;
+        TranslateForDebugResult pcxlat;
+        if (!cpu_translate_for_debug(s->cs, s->pc, &pcxlat)) break;
         uint32_t insn = 0;
-        cpu_physical_memory_read(gpa, &insn, sizeof(insn));
+        cpu_physical_memory_read(pcxlat.physaddr, &insn, sizeof(insn));
         if ((insn & 0x3) != 0x3) { s->pc += 2; continue; }
         uint64_t npc = ra_sim(s, insn);
         if (!npc) break;
