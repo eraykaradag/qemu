@@ -240,6 +240,17 @@ typedef struct {
 #define RUNAHEAD_TARGET_PAGES  64
 
 typedef struct {
+    QemuSemaphore  sem;
+    QemuThread     thread;
+    CPUState      *pending_cpu;
+    GHashTable    *seen;
+    bool           initialized;
+    bool           running;
+} RunaheadCtx;
+
+static RunaheadCtx runahead_ctx;
+
+typedef struct {
     CPUState               *cs;
     uint64_t                regs[32];
     uint64_t                reg_valid;
@@ -276,6 +287,16 @@ static bool runahead_snapshot(RunaheadState *s, CPUState *cs)
 static int postcopy_request_page(MigrationIncomingState *mis, RAMBlock *rb,
                                  ram_addr_t start, uint64_t haddr, uint32_t tid);
 
+static bool ra_need_prefetch(RAMBlock *rb, ram_addr_t aligned_rbo, void *hva)
+{
+    if (ramblock_recv_bitmap_test_byte_offset(rb, aligned_rbo))
+        return false;
+    if (g_hash_table_contains(runahead_ctx.seen, hva))
+        return false;
+    g_hash_table_add(runahead_ctx.seen, hva);
+    return true;
+}
+
 static void ra_prefetch(RunaheadState *s, uint64_t gva)
 {
     TranslateForDebugResult xlat;
@@ -289,7 +310,9 @@ static void ra_prefetch(RunaheadState *s, uint64_t gva)
     ram_addr_t rbo;
     RAMBlock *rb = qemu_ram_block_from_host(hva, true, &rbo);
     if (!rb) return;
-    postcopy_request_page(s->mis, rb, rbo, (uint64_t)(uintptr_t)hva, 0);
+    ram_addr_t aligned_rbo = ROUND_DOWN(rbo, qemu_ram_pagesize(rb));
+    if (!ra_need_prefetch(rb, aligned_rbo, hva)) return;
+    postcopy_request_page(s->mis, rb, aligned_rbo, (uint64_t)(uintptr_t)hva, 0);
     s->prefetch_count++;
 }
 
@@ -420,16 +443,6 @@ static uint64_t ra_sim(RunaheadState *s, uint32_t insn)
 done:
     return npc;
 }
-
-typedef struct {
-    QemuSemaphore  sem;
-    QemuThread     thread;
-    CPUState      *pending_cpu;
-    bool           initialized;
-    bool           running;
-} RunaheadCtx;
-
-static RunaheadCtx runahead_ctx;
 
 static void *runahead_thread(void *opaque)
 {
@@ -1079,6 +1092,7 @@ int postcopy_ram_incoming_cleanup(MigrationIncomingState *mis)
         qemu_sem_post(&runahead_ctx.sem);
         qemu_thread_join(&runahead_ctx.thread);
         qemu_sem_destroy(&runahead_ctx.sem);
+        g_hash_table_destroy(runahead_ctx.seen);
         runahead_ctx.initialized = false;
         fprintf(stderr, "[RUNAHEAD] Thread joined and cleaned up\n");
     }
@@ -1669,6 +1683,7 @@ static void *postcopy_ram_fault_thread(void *opaque)
                 if (faulted_cpu) {
                     if (!runahead_ctx.initialized) {
                         qemu_sem_init(&runahead_ctx.sem, 0);
+                        runahead_ctx.seen = g_hash_table_new(NULL, NULL);
                         qemu_thread_create(&runahead_ctx.thread, "runahead",
                                            runahead_thread, mis,
                                            QEMU_THREAD_JOINABLE);
