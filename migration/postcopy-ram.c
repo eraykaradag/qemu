@@ -234,6 +234,7 @@ typedef struct {
  * ------------------------------------------------------------------ */
 
 #include "hw/core/cpu.h"
+#include "target/riscv/instmap.h"
 
 #define RUNAHEAD_MAX_INSNS   2048
 #define RUNAHEAD_TARGET_PAGES  64
@@ -256,8 +257,6 @@ static inline void ra_write(RunaheadState *s, int rd, uint64_t v)
 static inline void ra_inv(RunaheadState *s, int rd)
 { if (rd) s->reg_valid &= ~(1ULL << rd); }
 
-static inline int64_t ra_sext(uint64_t v, int bits)
-{ int sh = 64 - bits; return (int64_t)(v << sh) >> sh; }
 
 static bool runahead_snapshot(RunaheadState *s, CPUState *cs)
 {
@@ -296,83 +295,127 @@ static void ra_prefetch(RunaheadState *s, uint64_t gva)
 
 static uint64_t ra_sim(RunaheadState *s, uint32_t insn)
 {
-    int op=insn&0x7F, rd=(insn>>7)&0x1F, rs1=(insn>>15)&0x1F,
-        rs2=(insn>>20)&0x1F, f3=(insn>>12)&0x7, f7=(insn>>25)&0x7F;
+    int op  = MASK_OP_MAJOR(insn);
+    int rd  = GET_RD(insn);
+    int rs1 = GET_RS1(insn);
+    int rs2 = GET_RS2(insn);
+    int f3  = GET_FUNCT3(insn);
+    int f7  = GET_FUNCT7(insn);
     uint64_t npc = s->pc + 4;
+
     switch (op) {
-    case 0x03: case 0x07: {
-        int64_t imm = ra_sext(insn>>20, 12);
-        if (ra_valid(s,rs1)) ra_prefetch(s, s->regs[rs1]+imm);
-        if (op==0x03) ra_inv(s,rd); break; }
-    case 0x23: case 0x27: {
-        int64_t imm = ra_sext(((insn>>25)<<5)|((insn>>7)&0x1F), 12);
-        if (ra_valid(s,rs1)) ra_prefetch(s, s->regs[rs1]+imm); break; }
-    case 0x2F:
-        if (ra_valid(s,rs1)) ra_prefetch(s, s->regs[rs1]);
-        ra_inv(s,rd); break;
-    case 0x37: ra_write(s,rd,(int64_t)(int32_t)(insn&0xFFFFF000)); break;
-    case 0x17: ra_write(s,rd,s->pc+(int64_t)(int32_t)(insn&0xFFFFF000)); break;
-    case 0x13: {
-        if (!ra_valid(s,rs1)){ra_inv(s,rd);break;}
-        uint64_t a=s->regs[rs1], sh=(insn>>20)&0x3F, res;
-        int64_t imm=ra_sext(insn>>20,12);
-        switch(f3){
-        case 0:res=a+imm;break; case 1:res=a<<sh;break;
-        case 2:res=(int64_t)a<imm?1:0;break;
-        case 3:res=a<(uint64_t)(int64_t)imm?1:0;break;
-        case 4:res=a^(uint64_t)imm;break;
-        case 5:res=(f7&0x20)?(uint64_t)((int64_t)a>>sh):a>>sh;break;
-        case 6:res=a|(uint64_t)imm;break;
-        case 7:res=a&(uint64_t)imm;break;
-        default:ra_inv(s,rd);goto done;}
-        ra_write(s,rd,res); break; }
-    case 0x1B: {
-        if (!ra_valid(s,rs1)){ra_inv(s,rd);break;}
-        uint64_t a=s->regs[rs1], sh=(insn>>20)&0x1F, res;
-        int64_t imm=ra_sext(insn>>20,12);
-        switch(f3){
-        case 0:res=(int64_t)(int32_t)((uint32_t)a+(int32_t)imm);break;
-        case 1:res=(int64_t)(int32_t)((uint32_t)a<<sh);break;
-        case 5:res=(f7&0x20)?(int64_t)((int32_t)a>>sh):(int64_t)(int32_t)((uint32_t)a>>sh);break;
-        default:ra_inv(s,rd);goto done;}
-        ra_write(s,rd,res); break; }
-    case 0x33: {
-        if (!ra_valid(s,rs1)||!ra_valid(s,rs2)){ra_inv(s,rd);break;}
-        if (f7==0x01){ra_inv(s,rd);break;}
-        uint64_t a=s->regs[rs1],b=s->regs[rs2],res;
-        switch(f3){
-        case 0:res=(f7&0x20)?a-b:a+b;break; case 1:res=a<<(b&0x3F);break;
-        case 2:res=(int64_t)a<(int64_t)b?1:0;break; case 3:res=a<b?1:0;break;
-        case 4:res=a^b;break;
-        case 5:res=(f7&0x20)?(uint64_t)((int64_t)a>>(b&0x3F)):a>>(b&0x3F);break;
-        case 6:res=a|b;break; case 7:res=a&b;break;
-        default:ra_inv(s,rd);goto done;}
-        ra_write(s,rd,res); break; }
-    case 0x3B: {
-        if (!ra_valid(s,rs1)||!ra_valid(s,rs2)){ra_inv(s,rd);break;}
-        if (f7==0x01){ra_inv(s,rd);break;}
-        uint64_t a=s->regs[rs1],b=s->regs[rs2],res;
-        switch(f3){
-        case 0:res=(int64_t)(int32_t)((f7&0x20)?a-b:a+b);break;
-        case 1:res=(int64_t)(int32_t)((uint32_t)a<<(b&0x1F));break;
-        case 5:res=(f7&0x20)?(int64_t)((int32_t)a>>(b&0x1F)):(int64_t)(int32_t)((uint32_t)a>>(b&0x1F));break;
-        default:ra_inv(s,rd);goto done;}
-        ra_write(s,rd,res); break; }
-    case 0x6F: {
-        int64_t imm=ra_sext((((insn>>31)&1)<<20)|(((insn>>12)&0xFF)<<12)|
-                            (((insn>>20)&1)<<11)|(((insn>>21)&0x3FF)<<1),21);
-        ra_write(s,rd,s->pc+4); npc=s->pc+imm; break; }
-    case 0x67: {
-        int64_t imm=ra_sext(insn>>20,12);
-        ra_write(s,rd,s->pc+4);
-        if (!ra_valid(s,rs1)) return 0;
-        npc=(s->regs[rs1]+imm)&~1ULL; break; }
-    case 0x63: {
-        int64_t imm=ra_sext((((insn>>31)&1)<<12)|(((insn>>7)&1)<<11)|
-                            (((insn>>25)&0x3F)<<5)|(((insn>>8)&0xF)<<1),13);
-        if (imm<0) npc=s->pc+imm; break; }
-    case 0x0F: case 0x73: break;
-    default: return 0;
+    case OPC_RISC_LOAD:
+    case OPC_RISC_FP_LOAD: {
+        int64_t imm = GET_IMM(insn);
+        if (ra_valid(s, rs1)) ra_prefetch(s, s->regs[rs1] + imm);
+        if (op == OPC_RISC_LOAD) ra_inv(s, rd);
+        break;
+    }
+    case OPC_RISC_STORE:
+    case OPC_RISC_FP_STORE: {
+        int64_t imm = GET_STORE_IMM(insn);
+        if (ra_valid(s, rs1)) ra_prefetch(s, s->regs[rs1] + imm);
+        break;
+    }
+    case OPC_RISC_ATOMIC:
+        if (ra_valid(s, rs1)) ra_prefetch(s, s->regs[rs1]);
+        ra_inv(s, rd);
+        break;
+    case OPC_RISC_LUI:
+        ra_write(s, rd, (int64_t)(int32_t)(insn & 0xFFFFF000));
+        break;
+    case OPC_RISC_AUIPC:
+        ra_write(s, rd, s->pc + (int64_t)(int32_t)(insn & 0xFFFFF000));
+        break;
+    case OPC_RISC_ARITH_IMM: {
+        if (!ra_valid(s, rs1)) { ra_inv(s, rd); break; }
+        uint64_t a = s->regs[rs1], sh = (insn >> 20) & 0x3F, res;
+        int64_t imm = GET_IMM(insn);
+        switch (f3) {
+        case 0: res = a + imm;                                          break;
+        case 1: res = a << sh;                                          break;
+        case 2: res = (int64_t)a < imm ? 1 : 0;                        break;
+        case 3: res = a < (uint64_t)(int64_t)imm ? 1 : 0;              break;
+        case 4: res = a ^ (uint64_t)imm;                                break;
+        case 5: res = (f7 & 0x20) ? (uint64_t)((int64_t)a >> sh)
+                                  : a >> sh;                            break;
+        case 6: res = a | (uint64_t)imm;                                break;
+        case 7: res = a & (uint64_t)imm;                                break;
+        default: ra_inv(s, rd); goto done;
+        }
+        ra_write(s, rd, res);
+        break;
+    }
+    case OPC_RISC_ARITH_IMM_W: {
+        if (!ra_valid(s, rs1)) { ra_inv(s, rd); break; }
+        uint64_t a = s->regs[rs1], sh = (insn >> 20) & 0x1F, res;
+        int64_t imm = GET_IMM(insn);
+        switch (f3) {
+        case 0: res = (int64_t)(int32_t)((uint32_t)a + (int32_t)imm);  break;
+        case 1: res = (int64_t)(int32_t)((uint32_t)a << sh);            break;
+        case 5: res = (f7 & 0x20) ? (int64_t)((int32_t)a >> sh)
+                     : (int64_t)(int32_t)((uint32_t)a >> sh);           break;
+        default: ra_inv(s, rd); goto done;
+        }
+        ra_write(s, rd, res);
+        break;
+    }
+    case OPC_RISC_ARITH: {
+        if (!ra_valid(s, rs1) || !ra_valid(s, rs2)) { ra_inv(s, rd); break; }
+        if (f7 == 0x01) { ra_inv(s, rd); break; } /* M extension */
+        uint64_t a = s->regs[rs1], b = s->regs[rs2], res;
+        switch (f3) {
+        case 0: res = (f7 & 0x20) ? a - b : a + b;                     break;
+        case 1: res = a << (b & 0x3F);                                  break;
+        case 2: res = (int64_t)a < (int64_t)b ? 1 : 0;                 break;
+        case 3: res = a < b ? 1 : 0;                                    break;
+        case 4: res = a ^ b;                                            break;
+        case 5: res = (f7 & 0x20) ? (uint64_t)((int64_t)a >> (b & 0x3F))
+                                  : a >> (b & 0x3F);                    break;
+        case 6: res = a | b;                                            break;
+        case 7: res = a & b;                                            break;
+        default: ra_inv(s, rd); goto done;
+        }
+        ra_write(s, rd, res);
+        break;
+    }
+    case OPC_RISC_ARITH_W: {
+        if (!ra_valid(s, rs1) || !ra_valid(s, rs2)) { ra_inv(s, rd); break; }
+        if (f7 == 0x01) { ra_inv(s, rd); break; } /* M extension */
+        uint64_t a = s->regs[rs1], b = s->regs[rs2], res;
+        switch (f3) {
+        case 0: res = (int64_t)(int32_t)((f7 & 0x20) ? a - b : a + b); break;
+        case 1: res = (int64_t)(int32_t)((uint32_t)a << (b & 0x1F));    break;
+        case 5: res = (f7 & 0x20) ? (int64_t)((int32_t)a >> (b & 0x1F))
+                     : (int64_t)(int32_t)((uint32_t)a >> (b & 0x1F));   break;
+        default: ra_inv(s, rd); goto done;
+        }
+        ra_write(s, rd, res);
+        break;
+    }
+    case OPC_RISC_JAL: {
+        int64_t imm = GET_JAL_IMM(insn);
+        ra_write(s, rd, s->pc + 4);
+        npc = s->pc + imm;
+        break;
+    }
+    case OPC_RISC_JALR: {
+        int64_t imm = GET_IMM(insn);
+        ra_write(s, rd, s->pc + 4);
+        if (!ra_valid(s, rs1)) return 0;
+        npc = (s->regs[rs1] + imm) & ~1ULL;
+        break;
+    }
+    case OPC_RISC_BRANCH: {
+        int64_t imm = GET_B_IMM(insn);
+        if (imm < 0) npc = s->pc + imm;
+        break;
+    }
+    case OPC_RISC_FENCE:
+    case OPC_RISC_SYSTEM:
+        break;
+    default:
+        return 0;
     }
 done:
     return npc;
