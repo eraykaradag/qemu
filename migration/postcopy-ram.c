@@ -422,60 +422,57 @@ done:
 }
 
 typedef struct {
-    CPUState               *cs;
-    MigrationIncomingState *mis;
-} RunaheadArgs;
+    QemuSemaphore  sem;
+    QemuThread     thread;
+    CPUState      *pending_cpu;
+    bool           initialized;
+    bool           running;
+} RunaheadCtx;
+
+static RunaheadCtx runahead_ctx;
 
 static void *runahead_thread(void *opaque)
 {
-    RunaheadArgs *args = opaque;
-    CPUState *cs       = args->cs;
-    MigrationIncomingState *mis = args->mis;
-    g_free(args);
-
-    RunaheadState state = {0};
-    RunaheadState *s    = &state;
-    s->mis = mis;
-    int i;
-
+    MigrationIncomingState *mis = opaque;
     rcu_register_thread();
-    fprintf(stderr, "[RUNAHEAD] Thread started\n");
-    if (!runahead_snapshot(s, cs)) {
-        fprintf(stderr, "[RUNAHEAD] Register snapshot failed\n");
-        goto out;
+    while (true) {
+        qemu_sem_wait(&runahead_ctx.sem);
+        CPUState *cs = qatomic_read(&runahead_ctx.pending_cpu);
+        if (!cs) break;
+
+        RunaheadState state = {0};
+        RunaheadState *s    = &state;
+        s->mis = mis;
+        int i  = 0;
+
+        fprintf(stderr, "[RUNAHEAD] Thread woken up\n");
+        if (!runahead_snapshot(s, cs)) {
+            fprintf(stderr, "[RUNAHEAD] Register snapshot failed\n");
+            goto done;
+        }
+        fprintf(stderr, "[RUNAHEAD] PC=0x%"PRIx64"\n", s->pc);
+        if (s->pc >> 56) {
+            fprintf(stderr, "[RUNAHEAD] Kernel PC, skipping\n");
+            goto done;
+        }
+        for (i = 0; i < RUNAHEAD_MAX_INSNS; i++) {
+            if (s->prefetch_count >= RUNAHEAD_TARGET_PAGES) break;
+            TranslateForDebugResult pcxlat;
+            if (!cpu_translate_for_debug(s->cs, s->pc, &pcxlat)) break;
+            uint32_t insn = 0;
+            cpu_physical_memory_read(pcxlat.physaddr, &insn, sizeof(insn));
+            if ((insn & 0x3) != 0x3) { s->pc += 2; continue; }
+            uint64_t npc = ra_sim(s, insn);
+            if (!npc) break;
+            s->pc = npc;
+        }
+        fprintf(stderr, "[RUNAHEAD] Done after %d insns, %lu pages prefetched\n",
+                i, s->prefetch_count);
+done:
+        qatomic_set(&runahead_ctx.running, false);
     }
-    fprintf(stderr, "[RUNAHEAD] PC=0x%"PRIx64"\n", s->pc);
-    if (s->pc >> 56) {
-        fprintf(stderr, "[RUNAHEAD] Kernel PC, skipping\n");
-        goto out;
-    }
-    for (i = 0; i < RUNAHEAD_MAX_INSNS; i++) {
-        if (s->prefetch_count >= RUNAHEAD_TARGET_PAGES) break;
-        TranslateForDebugResult pcxlat;
-        if (!cpu_translate_for_debug(s->cs, s->pc, &pcxlat)) break;
-        uint32_t insn = 0;
-        cpu_physical_memory_read(pcxlat.physaddr, &insn, sizeof(insn));
-        if ((insn & 0x3) != 0x3) { s->pc += 2; continue; }
-        uint64_t npc = ra_sim(s, insn);
-        if (!npc) break;
-        s->pc = npc;
-    }
-    fprintf(stderr, "[RUNAHEAD] Done after %d insns, %lu pages prefetched\n",
-            i, s->prefetch_count);
-out:
     rcu_unregister_thread();
     return NULL;
-}
-
-static void runahead_start(CPUState *cs, MigrationIncomingState *mis)
-{
-    RunaheadArgs *args = g_new0(RunaheadArgs, 1);
-    args->cs  = cs;
-    args->mis = mis;
-
-    QemuThread t;
-    qemu_thread_create(&t, "runahead", runahead_thread, args,
-                       QEMU_THREAD_DETACHED);
 }
 
 
@@ -1077,6 +1074,15 @@ int postcopy_ram_incoming_cleanup(MigrationIncomingState *mis)
         mis->preempt_thread_status = PREEMPT_THREAD_NONE;
     }
 
+    if (runahead_ctx.initialized) {
+        qatomic_set(&runahead_ctx.pending_cpu, NULL);
+        qemu_sem_post(&runahead_ctx.sem);
+        qemu_thread_join(&runahead_ctx.thread);
+        qemu_sem_destroy(&runahead_ctx.sem);
+        runahead_ctx.initialized = false;
+        fprintf(stderr, "[RUNAHEAD] Thread joined and cleaned up\n");
+    }
+
     if (mis->have_fault_thread) {
         Error *local_err = NULL;
 
@@ -1540,7 +1546,6 @@ static void *postcopy_ram_fault_thread(void *opaque)
     int ret;
     size_t index;
     RAMBlock *rb = NULL;
-    static bool runahead_triggered = false;
 
     trace_postcopy_ram_fault_thread_entry();
     rcu_register_thread();
@@ -1649,8 +1654,8 @@ static void *postcopy_ram_fault_thread(void *opaque)
                                                 qemu_ram_get_idstr(rb),
                                                 rb_offset,
                                                 msg.arg.pagefault.feat.ptid);
-            if (!runahead_triggered &&
-                    msg.arg.pagefault.feat.ptid != 0) {
+            if (msg.arg.pagefault.feat.ptid != 0 &&
+                    !qatomic_read(&runahead_ctx.running)) {
                 CPUState *faulted_cpu = NULL;
                 CPUState *cpu_iter;
                 CPU_FOREACH(cpu_iter) {
@@ -1662,9 +1667,17 @@ static void *postcopy_ram_fault_thread(void *opaque)
                 }
 
                 if (faulted_cpu) {
-                    runahead_triggered = true;
-                    fprintf(stderr, "[RUNAHEAD] Caught first page fault\n");
-                    runahead_start(faulted_cpu, mis);
+                    if (!runahead_ctx.initialized) {
+                        qemu_sem_init(&runahead_ctx.sem, 0);
+                        qemu_thread_create(&runahead_ctx.thread, "runahead",
+                                           runahead_thread, mis,
+                                           QEMU_THREAD_JOINABLE);
+                        runahead_ctx.initialized = true;
+                        fprintf(stderr, "[RUNAHEAD] Thread created\n");
+                    }
+                    qatomic_set(&runahead_ctx.pending_cpu, faulted_cpu);
+                    qatomic_set(&runahead_ctx.running, true);
+                    qemu_sem_post(&runahead_ctx.sem);
                 }
             }
 retry:
