@@ -256,8 +256,9 @@ static RunaheadStats g_stats;
 typedef struct {
     QemuSemaphore  sem;
     QemuThread     thread;
-    CPUState      *pending_cpu;
-    uint64_t       pending_fault_addr;
+    CPUState      *pending_cpu;   /* NULL = shutdown signal */
+    uint64_t       snapshot_pc;
+    uint64_t       snapshot_regs[32];
     GHashTable    *seen;
     bool           initialized;
     bool           running;
@@ -282,21 +283,6 @@ static inline void ra_write(RunaheadState *s, int rd, uint64_t v)
 
 static inline void ra_inv(RunaheadState *s, int rd)
 { if (rd) s->reg_valid &= ~(1ULL << rd); }
-
-
-static bool runahead_snapshot(RunaheadState *s, CPUState *cs)
-{
-    CPUClass *cc = CPU_GET_CLASS(cs);
-    if (!cc->runahead_get_regs) {
-        fprintf(stderr, "[RUNAHEAD] runahead_get_regs not implemented for this CPU\n");
-        return false;
-    }
-    s->cs = cs;
-    cc->runahead_get_regs(cs, &s->pc, s->regs);
-    s->regs[0]   = 0;
-    s->reg_valid = ~0ULL;
-    return true;
-}
 
 /* Forward declaration */
 static int postcopy_request_page(MigrationIncomingState *mis, RAMBlock *rb,
@@ -332,14 +318,6 @@ static void ra_prefetch(RunaheadState *s, uint64_t gva)
     RAMBlock *rb = qemu_ram_block_from_host(hva, true, &rbo);
     if (!rb) return;
     ram_addr_t aligned_rbo = ROUND_DOWN(rbo, qemu_ram_pagesize(rb));
-    if (s->prefetch_count == 0) {
-        uint64_t fault_hva = qatomic_read(&runahead_ctx.pending_fault_addr);
-        uint64_t sim_hva   = ROUND_DOWN((uintptr_t)hva, qemu_ram_pagesize(rb));
-        fprintf(stderr,
-                "[RUNAHEAD-DBG] first_prefetch sim_hva=0x%"PRIx64
-                " fault_hva=0x%"PRIx64" match=%d\n",
-                sim_hva, fault_hva, sim_hva == fault_hva);
-    }
     if (!ra_need_prefetch(rb, aligned_rbo, hva)) return;
     postcopy_request_page(s->mis, rb, aligned_rbo, (uint64_t)(uintptr_t)hva, 0);
     s->prefetch_count++;
@@ -487,14 +465,15 @@ static void *runahead_thread(void *opaque)
 
         RunaheadState state = {0};
         RunaheadState *s    = &state;
-        s->mis = mis;
+        s->mis      = mis;
+        s->cs       = cs;
+        s->pc       = runahead_ctx.snapshot_pc;
+        s->reg_valid = ~0ULL;
+        memcpy(s->regs, runahead_ctx.snapshot_regs, sizeof(s->regs));
+        s->regs[0]  = 0;
         int i  = 0;
 
         fprintf(stderr, "[RUNAHEAD] Thread woken up\n");
-        if (!runahead_snapshot(s, cs)) {
-            fprintf(stderr, "[RUNAHEAD] Register snapshot failed\n");
-            goto done;
-        }
         fprintf(stderr, "[RUNAHEAD] PC=0x%"PRIx64"\n", s->pc);
         if (s->pc >> 56) {
             fprintf(stderr, "[RUNAHEAD] Kernel PC, skipping\n");
@@ -1767,9 +1746,15 @@ static void *postcopy_ram_fault_thread(void *opaque)
                         runahead_ctx.initialized = true;
                         fprintf(stderr, "[RUNAHEAD] Thread created\n");
                     }
+                    {
+                        CPUClass *cc = CPU_GET_CLASS(faulted_cpu);
+                        if (cc->runahead_get_regs) {
+                            cc->runahead_get_regs(faulted_cpu,
+                                                  &runahead_ctx.snapshot_pc,
+                                                  runahead_ctx.snapshot_regs);
+                        }
+                    }
                     qatomic_set(&runahead_ctx.pending_cpu, faulted_cpu);
-                    qatomic_set(&runahead_ctx.pending_fault_addr,
-                                msg.arg.pagefault.address);
                     qatomic_set(&runahead_ctx.running, true);
                     qemu_sem_post(&runahead_ctx.sem);
                 }
