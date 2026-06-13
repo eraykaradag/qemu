@@ -236,7 +236,7 @@ typedef struct {
 #include "hw/core/cpu.h"
 #include "target/riscv/instmap.h"
 
-#define RUNAHEAD_MAX_INSNS   2048
+#define RUNAHEAD_MAX_INSNS   50
 #define RUNAHEAD_TARGET_PAGES  64
 
 typedef struct {
