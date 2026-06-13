@@ -236,7 +236,7 @@ typedef struct {
 #include "hw/core/cpu.h"
 #include "target/riscv/instmap.h"
 
-#define RUNAHEAD_MAX_INSNS   50
+#define RUNAHEAD_MAX_INSNS   1024
 #define RUNAHEAD_TARGET_PAGES  64
 
 typedef struct {
@@ -259,6 +259,7 @@ typedef struct {
     CPUState      *pending_cpu;   /* NULL = shutdown signal */
     uint64_t       snapshot_pc;
     uint64_t       snapshot_regs[32];
+    uint64_t       fault_hva;     /* HVA that triggered this wakeup */
     GHashTable    *seen;
     bool           initialized;
     bool           running;
@@ -319,6 +320,13 @@ static void ra_prefetch(RunaheadState *s, uint64_t gva)
     if (!rb) return;
     ram_addr_t aligned_rbo = ROUND_DOWN(rbo, qemu_ram_pagesize(rb));
     if (!ra_need_prefetch(rb, aligned_rbo, hva)) return;
+    if (s->prefetch_count == 0) {
+        void *aligned_hva = (void *)ROUND_DOWN((uintptr_t)hva, qemu_ram_pagesize(rb));
+        void *fault_aligned = (void *)ROUND_DOWN((uintptr_t)runahead_ctx.fault_hva,
+                                                  qemu_ram_pagesize(rb));
+        fprintf(stderr, "[PREF] sim_hva=%p fault_hva=%p match=%d\n",
+                aligned_hva, fault_aligned, aligned_hva == fault_aligned);
+    }
     postcopy_request_page(s->mis, rb, aligned_rbo, (uint64_t)(uintptr_t)hva, 0);
     s->prefetch_count++;
 }
@@ -473,8 +481,8 @@ static void *runahead_thread(void *opaque)
         s->regs[0]  = 0;
         int i  = 0;
 
-        fprintf(stderr, "[RUNAHEAD] Thread woken up\n");
-        fprintf(stderr, "[RUNAHEAD] PC=0x%"PRIx64"\n", s->pc);
+        fprintf(stderr, "[RUNAHEAD] woken pc=0x%"PRIx64" fault_hva=0x%"PRIx64"\n",
+                s->pc, runahead_ctx.fault_hva);
         if (s->pc >> 56) {
             fprintf(stderr, "[RUNAHEAD] Kernel PC, skipping\n");
             goto done;
@@ -1754,6 +1762,7 @@ static void *postcopy_ram_fault_thread(void *opaque)
                                                   runahead_ctx.snapshot_regs);
                         }
                     }
+                    runahead_ctx.fault_hva = (uint64_t)msg.arg.pagefault.address;
                     qatomic_set(&runahead_ctx.pending_cpu, faulted_cpu);
                     qatomic_set(&runahead_ctx.running, true);
                     qemu_sem_post(&runahead_ctx.sem);
