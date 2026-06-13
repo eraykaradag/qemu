@@ -257,6 +257,7 @@ typedef struct {
     QemuSemaphore  sem;
     QemuThread     thread;
     CPUState      *pending_cpu;
+    uint64_t       pending_fault_addr;
     GHashTable    *seen;
     bool           initialized;
     bool           running;
@@ -331,6 +332,14 @@ static void ra_prefetch(RunaheadState *s, uint64_t gva)
     RAMBlock *rb = qemu_ram_block_from_host(hva, true, &rbo);
     if (!rb) return;
     ram_addr_t aligned_rbo = ROUND_DOWN(rbo, qemu_ram_pagesize(rb));
+    if (s->prefetch_count == 0) {
+        uint64_t fault_hva = qatomic_read(&runahead_ctx.pending_fault_addr);
+        uint64_t sim_hva   = ROUND_DOWN((uintptr_t)hva, qemu_ram_pagesize(rb));
+        fprintf(stderr,
+                "[RUNAHEAD-DBG] first_prefetch sim_hva=0x%"PRIx64
+                " fault_hva=0x%"PRIx64" match=%d\n",
+                sim_hva, fault_hva, sim_hva == fault_hva);
+    }
     if (!ra_need_prefetch(rb, aligned_rbo, hva)) return;
     postcopy_request_page(s->mis, rb, aligned_rbo, (uint64_t)(uintptr_t)hva, 0);
     s->prefetch_count++;
@@ -1759,6 +1768,8 @@ static void *postcopy_ram_fault_thread(void *opaque)
                         fprintf(stderr, "[RUNAHEAD] Thread created\n");
                     }
                     qatomic_set(&runahead_ctx.pending_cpu, faulted_cpu);
+                    qatomic_set(&runahead_ctx.pending_fault_addr,
+                                msg.arg.pagefault.address);
                     qatomic_set(&runahead_ctx.running, true);
                     qemu_sem_post(&runahead_ctx.sem);
                 }
