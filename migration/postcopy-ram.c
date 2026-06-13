@@ -240,6 +240,20 @@ typedef struct {
 #define RUNAHEAD_TARGET_PAGES  64
 
 typedef struct {
+    _Atomic uint64_t prefetch_sent;
+    _Atomic uint64_t recv_skipped;
+    _Atomic uint64_t duplicate_skipped;
+    _Atomic uint64_t inv_skipped;
+    _Atomic uint64_t decoded_total;
+    _Atomic uint64_t branch_stops;
+    _Atomic uint64_t total_faults;
+    _Atomic uint64_t prefetch_hits;
+    _Atomic uint64_t prefetch_misses;
+} RunaheadStats;
+
+static RunaheadStats g_stats;
+
+typedef struct {
     QemuSemaphore  sem;
     QemuThread     thread;
     CPUState      *pending_cpu;
@@ -289,11 +303,17 @@ static int postcopy_request_page(MigrationIncomingState *mis, RAMBlock *rb,
 
 static bool ra_need_prefetch(RAMBlock *rb, ram_addr_t aligned_rbo, void *hva)
 {
-    if (ramblock_recv_bitmap_test_byte_offset(rb, aligned_rbo))
+    void *aligned_hva = (void *)ROUND_DOWN((uintptr_t)hva, qemu_ram_pagesize(rb));
+    if (ramblock_recv_bitmap_test_byte_offset(rb, aligned_rbo)) {
+        qatomic_inc(&g_stats.recv_skipped);
         return false;
-    if (g_hash_table_contains(runahead_ctx.seen, hva))
+    }
+    if (g_hash_table_contains(runahead_ctx.seen, aligned_hva)) {
+        qatomic_inc(&g_stats.duplicate_skipped);
         return false;
-    g_hash_table_add(runahead_ctx.seen, hva);
+    }
+    g_hash_table_add(runahead_ctx.seen, aligned_hva);
+    qatomic_inc(&g_stats.prefetch_sent);
     return true;
 }
 
@@ -331,6 +351,7 @@ static uint64_t ra_sim(RunaheadState *s, uint32_t insn)
     case OPC_RISC_FP_LOAD: {
         int64_t imm = GET_IMM(insn);
         if (ra_valid(s, rs1)) ra_prefetch(s, s->regs[rs1] + imm);
+        else qatomic_inc(&g_stats.inv_skipped);
         if (op == OPC_RISC_LOAD) ra_inv(s, rd);
         break;
     }
@@ -338,10 +359,12 @@ static uint64_t ra_sim(RunaheadState *s, uint32_t insn)
     case OPC_RISC_FP_STORE: {
         int64_t imm = GET_STORE_IMM(insn);
         if (ra_valid(s, rs1)) ra_prefetch(s, s->regs[rs1] + imm);
+        else qatomic_inc(&g_stats.inv_skipped);
         break;
     }
     case OPC_RISC_ATOMIC:
         if (ra_valid(s, rs1)) ra_prefetch(s, s->regs[rs1]);
+        else qatomic_inc(&g_stats.inv_skipped);
         ra_inv(s, rd);
         break;
     case OPC_RISC_LUI:
@@ -475,8 +498,9 @@ static void *runahead_thread(void *opaque)
             uint32_t insn = 0;
             cpu_physical_memory_read(pcxlat.physaddr, &insn, sizeof(insn));
             if ((insn & 0x3) != 0x3) { s->pc += 2; continue; }
+            qatomic_inc(&g_stats.decoded_total);
             uint64_t npc = ra_sim(s, insn);
-            if (!npc) break;
+            if (!npc) { qatomic_inc(&g_stats.branch_stops); break; }
             s->pc = npc;
         }
         fprintf(stderr, "[RUNAHEAD] Done after %d insns, %lu pages prefetched\n",
@@ -1097,6 +1121,39 @@ int postcopy_ram_incoming_cleanup(MigrationIncomingState *mis)
         fprintf(stderr, "[RUNAHEAD] Thread joined and cleaned up\n");
     }
 
+    {
+        uint64_t tf   = qatomic_read(&g_stats.total_faults);
+        uint64_t hits = qatomic_read(&g_stats.prefetch_hits);
+        uint64_t sent = qatomic_read(&g_stats.prefetch_sent);
+        uint64_t used = hits;
+        fprintf(stderr,
+                "[SUMMARY]\n"
+                "  total_faults=%"PRIu64"\n"
+                "  prefetch_hits=%"PRIu64"\n"
+                "  prefetch_misses=%"PRIu64"\n"
+                "  prefetch_sent=%"PRIu64"\n"
+                "  prefetch_wasted=%"PRIu64"\n"
+                "  recv_skipped=%"PRIu64"\n"
+                "  duplicate_skipped=%"PRIu64"\n"
+                "  inv_skipped=%"PRIu64"\n"
+                "  decoded_total=%"PRIu64"\n"
+                "  branch_stops=%"PRIu64"\n"
+                "  hit_rate=%.2f%%\n"
+                "  waste_rate=%.2f%%\n",
+                tf,
+                hits,
+                qatomic_read(&g_stats.prefetch_misses),
+                sent,
+                sent > used ? sent - used : 0,
+                qatomic_read(&g_stats.recv_skipped),
+                qatomic_read(&g_stats.duplicate_skipped),
+                qatomic_read(&g_stats.inv_skipped),
+                qatomic_read(&g_stats.decoded_total),
+                qatomic_read(&g_stats.branch_stops),
+                tf  ? (double)hits / tf  * 100.0 : 0.0,
+                sent ? (double)(sent > used ? sent - used : 0) / sent * 100.0 : 0.0);
+    }
+
     if (mis->have_fault_thread) {
         Error *local_err = NULL;
 
@@ -1668,6 +1725,17 @@ static void *postcopy_ram_fault_thread(void *opaque)
                                                 qemu_ram_get_idstr(rb),
                                                 rb_offset,
                                                 msg.arg.pagefault.feat.ptid);
+            {
+                bool already_recv = ramblock_recv_bitmap_test_byte_offset(rb, rb_offset);
+                qatomic_inc(&g_stats.total_faults);
+                if (already_recv) {
+                    qatomic_inc(&g_stats.prefetch_hits);
+                } else {
+                    qatomic_inc(&g_stats.prefetch_misses);
+                }
+                fprintf(stderr, "[FAULT] addr=0x%"PRIx64" prefetched=%d\n",
+                        (uint64_t)msg.arg.pagefault.address, already_recv);
+            }
             if (msg.arg.pagefault.feat.ptid != 0 &&
                     !qatomic_read(&runahead_ctx.running)) {
                 CPUState *faulted_cpu = NULL;
