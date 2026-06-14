@@ -238,7 +238,7 @@ typedef struct {
 
 #define RUNAHEAD_MAX_INSNS    1024
 #define RUNAHEAD_TARGET_PAGES   64
-#define RUNAHEAD_ENABLED         0  /* 0 = baseline (no prefetch), 1 = runahead active */
+#define RUNAHEAD_ENABLED         1  /* 0 = baseline (no prefetch), 1 = runahead active */
 
 typedef struct {
     _Atomic uint64_t prefetch_sent;
@@ -260,6 +260,7 @@ typedef struct {
     CPUState      *pending_cpu;   /* NULL = shutdown signal */
     uint64_t       snapshot_pc;
     uint64_t       snapshot_regs[32];
+    uint64_t       snapshot_satp;  /* RISC-V SATP at fault time (address space ID) */
     uint64_t       fault_hva;     /* HVA that triggered this wakeup */
     GHashTable    *seen;
     bool           initialized;
@@ -306,14 +307,56 @@ static bool ra_need_prefetch(RAMBlock *rb, ram_addr_t aligned_rbo, void *hva)
     return true;
 }
 
+/*
+ * RISC-V Sv39/48/57 page table walk using a captured SATP value.
+ * Reads guest physical memory directly — no env->satp dependency, thread-safe.
+ */
+static bool ra_gva_to_gpa(uint64_t satp, uint64_t gva, hwaddr *gpa_out)
+{
+    int mode = (int)(satp >> 60);
+    uint64_t root_ppn = satp & 0x0FFFFFFFFFFFULL;
+    int levels;
+
+    switch (mode) {
+    case 8:  levels = 3; break;   /* Sv39 */
+    case 9:  levels = 4; break;   /* Sv48 */
+    case 10: levels = 5; break;   /* Sv57 */
+    default: return false;
+    }
+
+    uint64_t pt_pa = root_ppn << 12;
+
+    for (int i = levels - 1; i >= 0; i--) {
+        uint64_t vpn    = (gva >> (12 + 9 * i)) & 0x1FF;
+        uint64_t pte_pa = pt_pa + vpn * 8;
+        uint64_t pte    = 0;
+
+        cpu_physical_memory_read(pte_pa, &pte, 8);
+
+        if (!(pte & 0x1)) return false;       /* V=0, invalid */
+
+        uint64_t pte_ppn = (pte >> 10) & 0x0FFFFFFFFFFFULL;
+
+        if ((pte & 0xE) == 0) {               /* R=W=X=0, non-leaf */
+            pt_pa = pte_ppn << 12;
+        } else {                               /* leaf PTE */
+            uint64_t page_mask = (1ULL << (12 + 9 * i)) - 1;
+            *gpa_out = ((pte_ppn << 12) & ~page_mask) | (gva & page_mask);
+            return true;
+        }
+    }
+    return false;
+}
+
 static void ra_prefetch(RunaheadState *s, uint64_t gva)
 {
-    TranslateForDebugResult xlat;
-    if (!cpu_translate_for_debug(s->cs, gva, &xlat)) return;
+    hwaddr gpa;
+    if (!ra_gva_to_gpa(runahead_ctx.snapshot_satp, gva, &gpa)) return;
+
     RCU_READ_LOCK_GUARD();
     hwaddr off, len = TARGET_PAGE_SIZE;
     MemoryRegion *mr = address_space_translate(&address_space_memory,
-                           xlat.physaddr, &off, &len, false, MEMTXATTRS_UNSPECIFIED);
+                           gpa, &off, &len, false, MEMTXATTRS_UNSPECIFIED);
     if (!memory_region_is_ram(mr)) return;
     void *hva = qemu_map_ram_ptr(mr->ram_block, off);
     ram_addr_t rbo;
@@ -482,18 +525,19 @@ static void *runahead_thread(void *opaque)
         s->regs[0]  = 0;
         int i  = 0;
 
-        fprintf(stderr, "[RUNAHEAD] woken pc=0x%"PRIx64" fault_hva=0x%"PRIx64"\n",
-                s->pc, runahead_ctx.fault_hva);
+        fprintf(stderr, "[RUNAHEAD] woken pc=0x%"PRIx64
+                " fault_hva=0x%"PRIx64" satp=0x%"PRIx64"\n",
+                s->pc, runahead_ctx.fault_hva, runahead_ctx.snapshot_satp);
         if (s->pc >> 56) {
             fprintf(stderr, "[RUNAHEAD] Kernel PC, skipping\n");
             goto done;
         }
         for (i = 0; i < RUNAHEAD_MAX_INSNS; i++) {
             if (s->prefetch_count >= RUNAHEAD_TARGET_PAGES) break;
-            TranslateForDebugResult pcxlat;
-            if (!cpu_translate_for_debug(s->cs, s->pc, &pcxlat)) break;
+            hwaddr pc_gpa;
+            if (!ra_gva_to_gpa(runahead_ctx.snapshot_satp, s->pc, &pc_gpa)) break;
             uint32_t insn = 0;
-            cpu_physical_memory_read(pcxlat.physaddr, &insn, sizeof(insn));
+            cpu_physical_memory_read(pc_gpa, &insn, sizeof(insn));
             if ((insn & 0x3) != 0x3) { s->pc += 2; continue; }
             qatomic_inc(&g_stats.decoded_total);
             uint64_t npc = ra_sim(s, insn);
@@ -1761,7 +1805,8 @@ static void *postcopy_ram_fault_thread(void *opaque)
                         if (cc->runahead_get_regs) {
                             cc->runahead_get_regs(faulted_cpu,
                                                   &runahead_ctx.snapshot_pc,
-                                                  runahead_ctx.snapshot_regs);
+                                                  runahead_ctx.snapshot_regs,
+                                                  &runahead_ctx.snapshot_satp);
                         }
                     }
                     runahead_ctx.fault_hva = (uint64_t)msg.arg.pagefault.address;
