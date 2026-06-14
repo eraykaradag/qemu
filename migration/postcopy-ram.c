@@ -353,6 +353,11 @@ static void ra_prefetch(RunaheadState *s, uint64_t gva)
     hwaddr gpa;
     if (!ra_gva_to_gpa(runahead_ctx.snapshot_satp, gva, &gpa)) return;
 
+    static int debug_count = 0;
+    if (debug_count++ < 100) {
+        fprintf(stderr, "[PREF_TRY] gva=0x%lx\n", gva);
+    }
+
     RCU_READ_LOCK_GUARD();
     hwaddr off, len = TARGET_PAGE_SIZE;
     MemoryRegion *mr = address_space_translate(&address_space_memory,
@@ -540,6 +545,15 @@ static void *runahead_thread(void *opaque)
             uint32_t insn = 0;
             cpu_physical_memory_read(pc_gpa, &insn, sizeof(insn));
             if ((insn & 0x3) != 0x3) { s->pc += 2; continue; }
+
+            if (i < 100) {
+                uint32_t op  = insn & 0x7F;
+                uint32_t rs1 = (insn >> 15) & 0x1F;
+                uint32_t rd  = (insn >> 7)  & 0x1F;
+                fprintf(stderr, "[STEP %2d] pc=0x%lx insn=0x%08x op=0x%02x rs1=x%u(=0x%lx) rd=x%u\n",
+                        i, s->pc, insn, op, rs1, s->regs[rs1], rd);
+            }
+
             qatomic_inc(&g_stats.decoded_total);
             uint64_t npc = ra_sim(s, insn);
             if (!npc) { qatomic_inc(&g_stats.branch_stops); break; }
