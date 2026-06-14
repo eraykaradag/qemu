@@ -363,6 +363,7 @@ static void ra_prefetch(RunaheadState *s, uint64_t gva)
     RAMBlock *rb = qemu_ram_block_from_host(hva, true, &rbo);
     if (!rb) return;
     ram_addr_t aligned_rbo = ROUND_DOWN(rbo, qemu_ram_pagesize(rb));
+    if (aligned_rbo >= rb->used_length) return;
     if (!ra_need_prefetch(rb, aligned_rbo, hva)) return;
     if (s->prefetch_count == 0) {
         void *aligned_hva = (void *)ROUND_DOWN((uintptr_t)hva, qemu_ram_pagesize(rb));
