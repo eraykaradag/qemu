@@ -238,7 +238,7 @@ typedef struct {
 
 #define RUNAHEAD_MAX_INSNS    1024
 #define RUNAHEAD_TARGET_PAGES   64
-#define RUNAHEAD_ENABLED         1  /* 0 = baseline (no prefetch), 1 = runahead active */
+#define RUNAHEAD_ENABLED         0  /* 0 = baseline (no prefetch), 1 = runahead active */
 
 typedef struct {
     _Atomic uint64_t prefetch_sent;
@@ -1733,8 +1733,8 @@ static void *postcopy_ram_fault_thread(void *opaque)
                 fprintf(stderr, "[FAULT] addr=0x%"PRIx64" prefetched=%d\n",
                         (uint64_t)msg.arg.pagefault.address, already_recv);
             }
-#if RUNAHEAD_ENABLED
-            if (msg.arg.pagefault.feat.ptid != 0 &&
+            if (RUNAHEAD_ENABLED &&
+                    msg.arg.pagefault.feat.ptid != 0 &&
                     !qatomic_read(&runahead_ctx.running)) {
                 CPUState *faulted_cpu = NULL;
                 CPUState *cpu_iter;
@@ -1770,7 +1770,6 @@ static void *postcopy_ram_fault_thread(void *opaque)
                     qemu_sem_post(&runahead_ctx.sem);
                 }
             }
-#endif /* RUNAHEAD_ENABLED */
 retry:
             /*
              * Send the request to the source - we want to request one
