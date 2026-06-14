@@ -377,6 +377,9 @@ static void ra_prefetch(RunaheadState *s, uint64_t gva)
         fprintf(stderr, "[PREF] sim_hva=%p fault_hva=%p match=%d\n",
                 aligned_hva, fault_aligned, aligned_hva == fault_aligned);
     }
+
+    fprintf(stderr, "[PREF_FULL] gva=0x%lx hva=0x%lx\n",
+        gva, (uint64_t)hva);
     postcopy_request_page(s->mis, rb, aligned_rbo, (uint64_t)(uintptr_t)hva, 0);
     s->prefetch_count++;
 }
@@ -1824,6 +1827,15 @@ static void *postcopy_ram_fault_thread(void *opaque)
                                                   &runahead_ctx.snapshot_satp);
                         }
                     }
+                    fprintf(stderr, "[FAULT_FULL] hva=0x%lx ptid=%u "
+                                "snap_pc=0x%lx x14=0x%lx x15=0x%lx x19=0x%lx satp=0x%lx\n",
+                        (uint64_t)msg.arg.pagefault.address,
+                        msg.arg.pagefault.feat.ptid,
+                        runahead_ctx.snapshot_pc,
+                        runahead_ctx.snapshot_regs[14],
+                        runahead_ctx.snapshot_regs[15],
+                        runahead_ctx.snapshot_regs[19],
+                        runahead_ctx.snapshot_satp);
                     runahead_ctx.fault_hva = (uint64_t)msg.arg.pagefault.address;
                     qatomic_set(&runahead_ctx.pending_cpu, faulted_cpu);
                     qatomic_set(&runahead_ctx.running, true);

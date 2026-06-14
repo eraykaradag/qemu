@@ -105,6 +105,9 @@ static bool runahead_snapshot_registers(RunaheadState *s)
         return false;
     s->satp = reg;
 
+    fprintf(stderr, "[SNAP_REGS] pc=0x%lx x14=0x%lx x15=0x%lx x19=0x%lx satp=0x%lx\n",
+            s->pc, s->regs[14], s->regs[15], s->regs[19], s->satp);
+
     return true;
 }
 

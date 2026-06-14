@@ -828,6 +828,14 @@ static void riscv_cpu_runahead_get_regs(CPUState *cs, uint64_t *pc,
     CPURISCVState *env = &RISCV_CPU(cs)->env;
 
     bool from_user = !(env->mstatus & MSTATUS_SPP);
+    
+    fprintf(stderr, "[GET_REGS] mstatus=0x%lx SPP=%d from_user=%d "
+                    "env->pc=0x%lx env->sepc=0x%lx priv=%ld\n",
+            (uint64_t)env->mstatus,
+            (env->mstatus & MSTATUS_SPP) ? 1 : 0,
+            from_user,
+            (uint64_t)env->pc, (uint64_t)env->sepc,
+            env->priv);
 
     if (from_user) {
         *pc = env->sepc;        /* user-space instruction */
