@@ -826,8 +826,16 @@ static void riscv_cpu_runahead_get_regs(CPUState *cs, uint64_t *pc,
                                         uint64_t regs[32], uint64_t *ptbr)
 {
     CPURISCVState *env = &RISCV_CPU(cs)->env;
+
+    bool from_user = !(env->mstatus & MSTATUS_SPP);
+
+    if (from_user) {
+        *pc = env->sepc;        /* user-space instruction */
+    } else {
+        *pc = env->pc;           /* kernel mode, normal pc */
+    }
+
     int i;
-    *pc = env->pc;
     for (i = 0; i < 32; i++)
         regs[i] = env->gpr[i];
     *ptbr = env->satp;
